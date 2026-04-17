@@ -1,775 +1,673 @@
-# Vanir: Missing Patch Scanner
+# Vanir Python Language Support via tree-sitter
 
-Vanir is a source code-based static analysis tool that automatically identifies
-the list of missing security patches in the target system. By default, Vanir
-pulls up-to-date CVEs from [Open Source Vulnerabilities (OSV)](https://osv.dev/list?q=&ecosystem=Android)
-together with their corresponding signatures so that users can transparently
-scan missing patches for an up-to-date list of CVEs. Vanir currently supports
-C/C++ and Java source code, and Google-supplied Vanir signatures cover CVEs
-published through [Android security bulletins](https://source.android.com/docs/security/bulletin/asb-overview)
-since 2020 July. Vanir is primarily designed to detect missing security patches
-with low false-positive rate in a sustainable and scalable way.
+This document describes the design, implementation, and testing of Python language
+support added to Vanir using the tree-sitter parsing library.
 
-****
+---
 
-## Quick Start
+## Table of Contents
 
-### Install Vanir as a package using `pip`
+1. [Background](#background)
+2. [Architecture Overview](#architecture-overview)
+3. [Parsing Flow](#parsing-flow)
+4. [tree_sitter_base.py](#tree_sitter_basepy)
+5. [python_parser.py](#python_parserpy)
+6. [Python-specific Handling](#python-specific-handling)
+7. [language_parsers.py Fix](#language_parserspy-fix)
+8. [Build Changes](#build-changes)
+9. [Python 3.9 Guard](#python-39-guard)
+10. [Testing Across Python Versions](#testing-across-python-versions)
+11. [End-to-End Validation](#end-to-end-validation)
 
-1. Install Vanir.
+---
 
-    ```sh
-    pip install vanir
-    ```
+## Background
 
-2. To scan your Android repo project located at ~/my/android/repo, run:
+Vanir is a static analysis tool for detecting missing security patches. It supports
+C/C++ and Java using ANTLR4-based parsers. This change adds Python support using
+**tree-sitter**, a modern parser library where language support ships as pip packages,
+requiring no grammar files or build-time code generation.
 
-    ```sh
-    python -m vanir.detector_runner repo_scanner Android ~/my/android/repo
-    ```
+### ANTLR vs tree-sitter
 
-3. Find the missing patches identified by Vanir at `/tmp/vanir/report-YYYYMMDDhhmmss.html` and `/tmp/vanir/report-YYYYMMDDhhmmss.json`.
+| | ANTLR (C/C++, Java) | tree-sitter (Python) |
+|---|---|---|
+| Grammar | Hand-written `.g4` file | Pre-built pip package |
+| Build step | Yes (Bazel + Java) | No |
+| Runs in | Python | C (via Python bindings) |
+| Add new language | Write full grammar | `pip install tree-sitter-X` |
+| Output to Vanir | FunctionChunk + LineChunk | Same |
 
-Alternatively, follow the steps below to use the version from GitHub.
+Both parsers feed the same Vanir pipeline. The normalizer, hasher, and detector are
+unchanged.
 
-### Clone Vanir from GitHub
-> [!CAUTION]
-> This instruction is written based on systems using Bazel >= 8. For Bazel 7.1
-> and 7.0, edit .bazelrc to enable workspace and disable bzlmod.
-> For Bazel 6, remove or comment out the line `common --enable_workspace=False`
-> as this flag is not supported.
+### What tree-sitter gives you
 
-1. Install the following [prerequisite](#prerequisite) tools in a Linux machine
-if not already installed:
+tree-sitter produces a **CST (Concrete Syntax Tree)**, a structured representation
+of every token in the source file including punctuation, keywords, and whitespace
+tokens. For Vanir's purposes this is equivalent to an AST since we filter out noise
+via `SKIP_TOKEN_TYPES` and retain only meaningful code tokens.
 
-   * [Bazel](https://bazel.build/install/ubuntu#install-on-ubuntu)
-   * Git
+---
 
-      ```posix-terminal
-      sudo apt install git
-      ```
+## Architecture Overview
 
-   * JRE >= Java 11
+### Old inheritance chain
+```
+AbstractLanguageParser (ABC)
+    ├── CppParser
+    └── JavaParser
+```
 
-      ```posix-terminal
-      sudo apt install openjdk-11-jre
-      ```
+### New inheritance chain
+```
+AbstractLanguageParser (ABC)
+    ├── CppParser
+    ├── JavaParser
+    └── TreeSitterParserBase (ABC -- new middle layer)
+            └── PythonParser
+            └── GoParser (future)
+            └── RustParser (future)
+```
 
-2. Download Vanir and move to the Vanir directory.
+`TreeSitterParserBase` is an abstract middle layer that implements the full
+`get_chunks()` pipeline once for all tree-sitter parsers. Concrete parsers like
+`PythonParser` only implement the three language-specific methods.
 
-3. To scan your Android repo project located at `~/my/android/repo`, run:
+---
 
-    ```posix-terminal
-    bazel build //:detector_runner
-    ./bazel-bin/detector_runner repo_scanner Android ~/my/android/repo
-    ```
+## Parsing Flow
 
-4. Find the missing patches identified by Vanir at `/tmp/vanir/report-YYYYMMDDhhmmss.html` and `/tmp/vanir/report-YYYYMMDDhhmmss.json`
-
-For further details, please see the [User Guide](#user-guide) section.
-
-****
-
-## User Benefits
-
-**Code Variance Tolerance:** Vanir identifies missing security patches from the
-customized ones. This can be especially beneficial for downstream branch
-maintainers (such as Android device vendors and custom kernel maintainers) who
-usually need to make additional changes on the upstream code for adapting
-it to their devices and also want to make sure the security of their devices is
-aligned with the latest security updates.
-
-**Metadata-agnostic Detection:** Vanir fundamentally does not rely on metadata
-of the target system such as version number, commit histories and SBOMs. Vanir
-directly analyzes the actual source-code of the target system and pinpoints the
-files / functions requiring specific security patches. While Vanir user may
-choose to to filter out unwanted findings by providing metadata, its core
-detection logic is metadata-agnostic. This allows Vanir users the flexibility to
-utilize the tool with various options for different purpose.
-
-**Automated Signature Generation:** The Vanir signature generation process is
-highly automated, enabling vulnerability publishers (such as CNAs and ecosystem
-security maintainers) to efficiently utilize Vanir and ensure security patch
-adoption by their downstream branch maintainers, streamlining workflows and
-optimizing resource allocation.
-
-**Runtime:** Since Vanir uses source-code based static analysis to detect
-missing patches, the run time will be shorter compared to binary-based static
-analysis tools or dynamic analysis tools.
-
-**Transparency:** Vanir operates as a standalone, fully open-source application.
-This empowers users to independently investigate and address any vulnerabilities
-identified by Vanir, without relying on or being hindered by responses from
-external service providers.
-
-**Continuously Updated Vulnerability Data:** The Vanir tool is decoupled from
-the vulnerability data, and updated Android vulnerability data for Vanir will
-be maintained by the Google Android Security team in [OSV](https://osv.dev/list?q=&ecosystem=Android).
-This will allow the Vanir users to simply run the Vanir with the latest
-vulnerability data without monthly updates. Further contributions from other
-CNAs (CVE Numbering Authorities) or system security maintainers would allow
-users to utilize Vanir for other ecosystems.
-
-**CI/CD Integration:** Vanir is also provided in the form of Python library.
-Users can integrate the Vanir library into their own automated pipeline to
-verify any missing patches in a highly automated and systematic way.
-
-****
-
-## Architectural Overview
-
-### Macro-architecture
-
-![Vanir Macro Architecture](https://raw.githubusercontent.com/google/vanir/refs/heads/main/docs/images/vanir_macro_arch.png)
-
-Vanir mainly consists of two components — **Signature Generator** and
-**Detector**.
-
-**Signature Generator** generates Vanir signatures for each vulnerability. The
-vulnerability can be from any source, but it should be defined in a [OSV format](https://ossf.github.io/osv-schema/),
-and should contain security patch information in the `references` field in the
-following format:
+When Vanir scans a `.py` file, the following sequence is executed:
 
 ```
-"references": [
-  "type": "FIX",
-  "url": public URL string to the fix commit
+parse_file("attachments.py")          [language_parsers.py]
+        |
+        v
+get_parser_class("attachments.py")
+  sees .py extension, finds PythonParser
+        |
+        v
+PythonParser("attachments.py")        [tree_sitter_base.py __init__]
+  reads file bytes
+  Parser(PY_LANGUAGE).parse(bytes)
+  tree-sitter builds CST in memory
+        |
+        v
+get_chunks()                          [tree_sitter_base.py]
+  1. QueryCursor(FUNC_QUERY).matches(root)
+     finds all function_definition nodes
+  2. For each function:
+     _extract_param_names()           [python_parser.py]
+     _extract_annotations()           [python_parser.py]
+     _collect_locals_calls()          [python_parser.py]
+     _flat_tokens_cursor()            [tree_sitter_base.py]
+     assembles FunctionChunkBase
+  3. _collect_tokens_cursor(root)
+     builds {line: tokens} for whole file -> LineChunkBase
+  4. _collect_errors_cursor(root)
+     collects ERROR nodes -> parse errors
+        |
+        v
+ParseResults(function_chunks, line_chunk, parse_errors)
+        |
+        v
+parser.py wraps chunks:
+  signature.create_function_chunk() -> FunctionChunk
+  signature.create_line_chunk()     -> LineChunk
+        |
+        v
+normalizer.py
+  replaces variable names with VAR_0, VAR_1
+  replaces function names with FN_0, FN_1
+        |
+        v
+hasher.py
+  MurmurHash3 on normalized tokens -> 128-bit hash per chunk
+        |
+        v
+Hash stored (sign generation) or compared (detection)
+```
+
+---
+
+## tree_sitter_base.py
+
+**Location:** `vanir/language_parsers/tree_sitter_base.py`
+
+This is the core new file. It contains three module-level cursor utility functions
+and the `TreeSitterParserBase` class.
+
+### Module-level utility functions
+
+#### `_collect_tokens_cursor(node, skip_types, string_type, out_dict)`
+
+Iterative TreeCursor walk that collects all meaningful tokens from a node's subtree,
+grouped by line number. At each node it makes one of three decisions:
+
+- **Skip** -- node type is in `skip_types` (comments, whitespace, etc.) and prune entire subtree
+- **Emit** -- node is a string literal or leaf (no children), record `node.text` under its line number
+- **Descend** -- node is a container, go into its children
+
+Navigation uses tree-sitter's C-level `TreeCursor`:
+- `cursor.goto_first_child()` -- go down
+- `cursor.goto_next_sibling()` -- go right
+- `cursor.goto_parent()` -- go up
+
+Result: `{line_number: [token, token, ...]}` for the whole file. Used for the
+**line chunk**.
+
+#### `_flat_tokens_cursor(node, skip_types, string_type)`
+
+Thin wrapper around `_collect_tokens_cursor`. Returns a flat ordered list of tokens
+sorted by line number. Used for **function chunk tokens**.
+
+#### `_collect_errors_cursor(root)`
+
+Walks the entire tree looking for `ERROR` nodes, places where tree-sitter could not
+parse the syntax. Unlike `_collect_tokens_cursor`, this never prunes -- it descends
+into ERROR nodes too, because errors may be nested inside partially parsed subtrees.
+
+Returns a list of `common.ParseError` with line number, column, and the bad token
+text. Vanir logs these as warnings but continues parsing the rest of the file.
+
+### `TreeSitterParserBase` class
+
+Implements the full `get_chunks()` pipeline. Subclasses set four class-level
+attributes:
+
+| Attribute | Purpose | Python example |
+|-----------|---------|----------------|
+| `LANGUAGE` | tree-sitter Language object | `_Language(_tspython.language())` |
+| `_FUNC_QUERY` | compiled query for function discovery | matches `function_definition` |
+| `SKIP_TOKEN_TYPES` | node types to prune | `{'comment', 'newline', 'indent', ...}` |
+| `STRING_NODE_TYPE` | node type for string literals | `'string'` |
+
+**`__init__(filename)`** reads the file and builds the syntax tree. `Parser` is
+imported lazily inside the method (not at module level) so the base class file can
+be safely imported on Python 3.9 where tree-sitter is not installed.
+
+**`get_chunks(affected_line_ranges_for_functions)`** is the main pipeline:
+
+1. Run `_FUNC_QUERY` to get all function nodes
+2. Filter to functions overlapping the requested line ranges
+3. For each function: extract name, parameters, annotations, locals, calls, tokens
+4. Build full-file token map for the line chunk
+5. Collect parse errors
+6. Return `ParseResults`
+
+Three steps in (3) are delegated to abstract methods that subclasses must implement.
+
+### Three abstract methods
+
+```python
+@abc.abstractmethod
+def _extract_param_names(self, params_node) -> list: ...
+
+@abc.abstractmethod
+def _extract_annotations(self, func_node) -> tuple: ...
+
+@abc.abstractmethod
+def _collect_locals_calls(self, body_node, nested_ranges) -> tuple: ...
+```
+
+These are left abstract because parameter syntax, type annotation syntax, and
+variable assignment syntax are all language-specific.
+
+---
+
+## python_parser.py
+
+**Location:** `vanir/language_parsers/python/python_parser.py`
+
+Thin subclass of `TreeSitterParserBase`. Compiles two queries at module import time
+and implements the three abstract methods.
+
+### Module-level setup
+
+```python
+try:
+    import tree_sitter_python as _tspython
+    from tree_sitter import Language as _Language
+    from tree_sitter import QueryCursor as _QueryCursor
+    _PY_LANGUAGE = _Language(_tspython.language())
+    _FUNC_QUERY = _PY_LANGUAGE.query("""
+        (function_definition
+            name: (identifier) @func.name
+            body: (block) @func.body) @func.def
+    """)
+    _LOCALS_QUERY = _PY_LANGUAGE.query("""
+        (assignment left: (_) @assign.lhs)
+        (augmented_assignment left: (identifier) @aug.lhs)
+        (for_statement left: (_) @for.lhs)
+        (named_expression name: (identifier) @walrus.name)
+        (call function: (identifier) @call.name)
+    """)
+    _TREE_SITTER_AVAILABLE = True
+except ImportError:
+    _PY_LANGUAGE = None
+    _FUNC_QUERY = None
+    _LOCALS_QUERY = None
+    _TREE_SITTER_AVAILABLE = False
+```
+
+Both queries are compiled once at import time, never per file. If tree-sitter is
+not installed (Python 3.9), `_TREE_SITTER_AVAILABLE` is set to `False` and all
+objects remain `None`.
+
+### `_FUNC_QUERY` -- function discovery
+
+S-expression pattern that matches every `function_definition` node in a Python file:
+```
+(function_definition
+    name: (identifier) @func.name
+    body: (block) @func.body) @func.def
+```
+Capture labels `@func.def`, `@func.name`, `@func.body` allow retrieving matched
+nodes by name from `QueryCursor.matches()`.
+
+Matches regular functions, async functions, and methods inside classes. Does not
+match lambdas (those are `lambda` nodes, not `function_definition`).
+
+### `_LOCALS_QUERY` -- variables and calls
+
+Five patterns covering all ways Python creates a variable:
+
+```python
+(assignment left: (_) @assign.lhs)                   # x = 1
+(augmented_assignment left: (_) @aug.lhs)             # x += 1
+(for_statement left: (_) @for.lhs)                   # for x in items:
+(named_expression name: (identifier) @walrus.name)   # (x := len(items))
+(call function: (identifier) @call.name)             # foo()
+```
+
+Each pattern is a different AST node type. There is no single "creates a variable"
+node in tree-sitter's Python grammar, so all five must be enumerated. Missing any
+one means those variable names are invisible to Vanir's function signature.
+
+### `PythonParser` class
+
+```python
+class PythonParser(TreeSitterParserBase):
+    LANGUAGE = _PY_LANGUAGE
+    _FUNC_QUERY = _FUNC_QUERY
+    SKIP_TOKEN_TYPES = frozenset({
+        'comment', 'newline', 'indent', 'dedent', 'line_continuation'
+    })
+    STRING_NODE_TYPE = 'string'
+
+    @classmethod
+    def get_supported_extensions(cls):
+        return ['.py'] if _TREE_SITTER_AVAILABLE else []
+```
+
+### `_extract_param_names`
+
+Loops through children of the `parameters` node. Each child may be one of several
+types:
+
+```
+parameters
+├── identifier               "self"        read .text directly
+├── typed_parameter          "data: str"   read identifier child only
+├── typed_default_parameter  "x: int = 0"  read identifier child only
+├── list_splat_pattern       "*args"        read identifier child
+└── dictionary_splat_pattern "**kwargs"    read identifier child
+```
+
+Returns: `["self", "data", "x", "args", "kwargs"]`
+
+### `_extract_annotations`
+
+Reads type hints from the function node:
+
+- **Return type** -- `func_node.child_by_field_name('return_type')` reads `-> bool` and returns `["bool"]`
+- **Parameter types** -- for each typed parameter, reads its `type` field and returns e.g. `["str"]`, `["List", "[", "int", "]"]`
+
+Both use `_flat_tokens_cursor` to get a flat token list from the annotation subtree.
+
+### `_collect_locals_calls`
+
+Runs `_LOCALS_QUERY` on the function body using `QueryCursor(_LOCALS_QUERY).captures(body_node)`.
+Returns a dict of capture label to list of nodes.
+
+For each captured node, checks `_is_nested()` -- if the node's byte offset falls
+inside a nested function's byte range, it is excluded. This prevents inner function
+variables from contaminating the outer function's local variable list.
+
+Returns `(local_vars_set, called_fns_set)`, both sets of strings.
+
+Back in the base class, parameters are subtracted from `local_vars_set` so parameter
+names do not appear in both lists.
+
+---
+
+## Python-specific Handling
+
+### SKIP_TOKEN_TYPES
+
+```python
+SKIP_TOKEN_TYPES = frozenset({
+    'comment',           # comments -- irrelevant to signatures
+    'newline',           # explicit newline tokens in Python CST
+    'indent',            # whitespace increase entering a block (Python uses indentation, not {})
+    'dedent',            # whitespace decrease leaving a block
+    'line_continuation', # backslash \ at end of line
+})
+```
+
+`frozenset` is used for O(1) lookup. This check runs on every node during tree
+walking.
+
+### STRING_NODE_TYPE
+
+All string literals -- `'hello'`, `"hello"`, `"""docstring"""`, `f"f-string"` -- are
+the same node type `'string'` in tree-sitter's Python grammar. Setting
+`STRING_NODE_TYPE = 'string'` causes the walker to emit the entire string as one
+opaque token rather than descending into its subtree.
+
+### Nested functions
+
+Both outer and inner functions are found by `_FUNC_QUERY`. The base class computes
+`nested_ranges` -- byte ranges of all functions nested inside the current function.
+`_collect_locals_calls` uses these to exclude captures that fall inside nested
+functions, so each function gets an independent, uncontaminated chunk.
+
+Example:
+
+```python
+def outer(self, filepath: str):
+    local_path = os.path.join(filepath)
+
+    def inner(x):
+        result = process(x)
+        return result
+
+    data = fetch(local_path)
+```
+
+Result for `outer`:
+```
+local_variables:  ["data", "local_path"]   # inner's "result" excluded
+called_functions: ["fetch"]                # inner's "process" excluded
+```
+
+Result for `inner` (its own separate chunk):
+```
+local_variables:  ["result"]
+called_functions: ["process"]
+```
+
+### Design decisions consistent with existing parsers
+
+Method chains are not captured as called functions across all Vanir parsers -- only
+bare function/method identifiers are collected. This is intentional: method chains
+vary widely across codebases and versions, and including them would produce unstable
+signatures with high false-negative rates.
+
+Lambdas are Python-specific and not extracted as function chunks. They appear as
+tokens within their enclosing function's token list, which is sufficient for
+line-based signature matching.
+
+Class definitions are not extracted as chunks in any Vanir parser. Methods inside
+classes are extracted as regular function chunks, consistent with how C++ and Java
+parsers handle class methods.
+
+---
+
+## language_parsers.py Fix
+
+When `TreeSitterParserBase` was introduced as a middle layer, `PythonParser` became
+an indirect subclass of `AbstractLanguageParser`. The existing `get_parser_class()`
+used `cls.__subclasses__()` which only returns direct subclasses -- so `PythonParser`
+became invisible to the parser lookup.
+
+Fix: replaced with a recursive function that skips abstract classes:
+
+```python
+def _all_subclasses(cls):
+    result = []
+    for sub in cls.__subclasses__():
+        if not sub.__abstractmethods__:   # skip abstract classes
+            result.append(sub)
+        result.extend(_all_subclasses(sub))  # recurse
+    return result
+```
+
+`__abstractmethods__` is a `frozenset` on every class -- empty for concrete classes,
+non-empty for abstract ones. This correctly excludes `TreeSitterParserBase` (which
+has three unimplemented abstract methods) while including `PythonParser` (which
+implements all of them).
+
+---
+
+## Build Changes
+
+### 1. `requirements/requirements.txt`
+
+```
+tree-sitter>=0.25.2; python_version>='3.10'
+tree-sitter-python>=0.23.4; python_version>='3.10'
+```
+
+PEP 508 environment markers -- pip reads `; python_version>='3.10'` and only installs
+tree-sitter on Python 3.10+. On 3.9 these lines are silently ignored.
+
+### 2. `requirements/requirements_lock_3.10.txt` through `requirements_lock_3.13.txt`
+
+Pinned tree-sitter versions added to each lock file. The `requirements_lock_3.9.txt`
+file has no tree-sitter entries.
+
+### 3. `vanir/language_parsers/BUILD.bazel`
+
+New Bazel library target for the base class:
+
+```python
+py_library(
+    name = "tree_sitter_base",
+    srcs = ["tree_sitter_base.py"],
+    deps = [":abstract_language_parser", ":common"],
+)
+```
+
+No tree-sitter dependency here -- the base class does not import tree-sitter at
+module level.
+
+### 4. `vanir/language_parsers/python/BUILD.bazel`
+
+tree-sitter added as a dependency of the Python parser:
+
+```python
+deps = [
+    "//vanir/language_parsers:tree_sitter_base",
+    requirement("tree-sitter"),
+    requirement("tree-sitter-python"),
 ]
 ```
 
-Vanir currently supports commits hosted in `googlesource.com` and
-`git.codelinaro.org`, but it can be easily extended to other hosts by adding new
-code extractor classes.
+---
 
-Once the generated signatures are shipped to OSV, the signatures can be
-transparently retrieved by **Vanir Detector**. Users may also use custom
-signatures by passing a JSON-format signature file to Vanir Detector. This can
-be useful for providing signatures of vulnerabilities that are not publicly
-announced yet or those for closed-source system.
+## Python 3.9 Guard
 
-The diagram below illustrates the macro-architecture of Vanir.
-
-### Micro-architecture
-
-The following diagram depicts the internal architecture of Vanir Signature
-Generator and Vanir Detector.
-
-![Vanir Micro Architecture](https://raw.githubusercontent.com/google/vanir/refs/heads/main/docs/images/vanir_micro_arch.png)
-
-Vanir was primarily designed to detect missing security patches with low
-false-positive rate in a sustainable and scalable way. To achieve the goal,
-Vanir utilizes multiple techniques in its internal components. This section
-offers a concise overview of several key Vanir components and spotlights
-specific techniques implemented within these components to support the
-overarching design objective.
-
-#### Parser
-
-The **parser** is a core component for extracting structural information from
-the target code. Since the original target of Vanir was Android, which consists
-of Linux kernel written in C and Android Framework written in C++ and Java, the
-current parser is implemented using Antlr4 C/C++ parser and Java parser. Vanir
-parser is designed to operate without build-time data. This approach enables
-Vanir to generate signatures and detect corresponding code blocks without
-requiring a build config.
-
-#### Normalizer and Hasher
-
-The extracted code blocks and structural information are passed to the
-**normalizer** and **hasher** components. The normalizer abstracts away
-security-insensitive tokens and the hahser convert the group of tokens into a
-128-bit hash. The normalizer and hasher process each code block using two
-different signature generation techniques:
-
-1. Line-based signature technique using code line n-grams, which is efficient
-for tolerating unrelated code mutations in distanced locations.
-
-1. Function-based signature technique using abstracted function body, which is
-efficient for tolerating code mutations less likely to affect security.
-
-While each signature type is specialized to tolerate certain types of code
-mutations, both approaches were designed conservatively so that they would
-not flag unrelated code as vulnerable code block. Vanir combines the two
-different approaches and make them complement each other and improve the
-overall sensitivity (i.e., lower the false-negative rate).
-
-The line-based and function-based signature generation techniques are inspired
-by the code clone detection algorithms proposed by Jang et al. \[1\] and Kim et
-al. \[2\], respectively. While there are some differences in the technical
-details and implementations, each technique remains closely aligned
-algorithmically with its corresponding research work. Reading these papers would
-be beneficial for those seeking a deeper understanding of the theoretical
-underpinnings.
-
-  * [1] [ReDeBug: Finding Unpatched Code Clones in Entire OS Distributions](https://www.ieee-security.org/TC/SP2012/papers/4681a048.pdf)
-  * [2] [VUDDY: A Scalable Approach for Vulnerable Code Clone Discovery](https://seulbae-security.github.io/pubs/vuddy-sp17.pdf)
-
-
-#### Refiner
-
-The newly generated signatures are then passed to **Refiner**, which is another
-key component of Vanir to ensure low false-positive rate in a scalable and
-efficient way. The refiner tests newly generated signatures against the ground
-truth files which are already known as patched. The set of ground truth files
-for a signature may vary depending on the quality of the vulnerability data.
-If provided vulnerability data contains patch information for a single branch
-(e.g., upstream), then it simply uses the revision with the patch commit as
-the ground truth. If vulnerability data contains patch information for multiple
-branches, the refiner tries to test each signature against all different
-branches and classifies them different depending on the result
-(`bad`, `version-specific`, `global`). Since the refiner automatically filters
-out problematic signatures, Vanir signature publishers can easily maintain the
-Vanir signature generation and publication process for their vulnerabilities
-without significant effort to maintain the quality of the published signatures.
-
-**Detector** follows a similar process of that of signature generation -
-it passes possibly affected files from the target system to the parser,
-normalizer and hasher, and compares the generated hashes with the given
-signatures. If a hash matches with a signature, then detector flags the
-corresponding vulnerability.
-
-#### Target Selector
-
-Another unique component in Detector is **Target Selector**. To optimize its
-run-time, Vanir tries to identify potentially affected files from the target
-system and analyzes only the identified files by default, and the way Vanir
-identifies the potentially affected files varies depending on the target
-selector. Vanir Detector currently offers three target selection strategies --
-`ALL_FILES`, `EXACT_PATH_MATCH` and `TRUNCATED_PATH_MATCH`:
-
-   * `ALL_FILES` strategy identifies all files as affected.
-   * `EXACT_PATH_MATCH` strategy identifies the files exactly matching the
- relative path of the files used for signature generation (aka
-*target file path*) as affected.
-   * `TRUNCATED_PATH_MATCH`  strategy identifies the files partially matching
-the *target file paths* as affected.
-
-As you may imagine, `ALL_FILES` is thorough but slow, while `EXACT_PATH_MATCH`
-is fast but may not cover directories and files moved to non-canonical paths.
-`TRUNCATED_PATH_MATCH` makes a balance between the two by identifying files
-matching subset of the signature's target file paths, allowing the use of Vanir
-for scanning complex target systems containing multiple packages in a single
-directory (e.g., multiple kernels, duplicated packages, out-of-tree kernel
-modules, same packages with different versions) without sacrificing performance.
-Vanir uses `TRUNCATED_PATH_MATCH` as a default target selection strategy.
-
-****
-
-## User Guide
-
-### Using the PyPI version
-
-#### Create a virtual environment (recommended to avoid dependency conflicts)
-
-Steps using virtualenv
-
-```sh
-virtualenv -p python3 ~/vanir-pip-env
-source ~/vanir-pip-env/bin/activate
-```
-
-For using specific python version such as `3.13`, steps using pyenv are as
-follows:
-
-```sh
-pyenv virtualenv 3.13 vanir-3.13
-pyenv activate vanir-3.13
-```
-
-#### Install and Test Vanir
-
-Install the latest vanir using `pip install` as follows:
-
-```sh
-pip install vanir
-```
-
-Run the unit tests:
-
-```sh
-python -m vanir.pip_modules.pip_test_runner
-```
-
-If all tests are successful, you will see the result similar to the following:
-
-```sh
-I0624 19:14:22.476867 140398746275584 pip_test_runner.py:134] Pass: vanir.code_extractors.code_extractor_android_test
-I0624 19:14:23.066157 140398746275584 pip_test_runner.py:134] Pass: vanir.code_extractors.code_extractor_test
-[...]
-I0624 19:14:49.976438 140398746275584 pip_test_runner.py:134] Pass: vanir.vulnerability_overwriter_test
-I0624 19:14:50.533897 140398746275584 pip_test_runner.py:134] Pass: vanir.vulnerability_test
-I0624 19:14:50.534017 140398746275584 pip_test_runner.py:205] Total tests: 31
-I0624 19:14:50.534083 140398746275584 pip_test_runner.py:206] Successfully ran 31 tests.
-```
-
-If the tests don't pass, please open an issue with the error logs, and we'll
-take a look.
-
-#### Run Vanir Detector from the PyPI Vanir
-
-To scan your Android repo project located at ~/my/android/repo, run:
-
-```sh
-python -m vanir.detector_runner repo_scanner Android ~/my/android/repo
-```
-
-Find the missing patches identified by Vanir at
-`/tmp/vanir/report-YYYYMMDDhhmmss.html` and
-`/tmp/vanir/report-YYYYMMDDhhmmss.json`.
-
-For more details and examples, please refer to [Run Vanir Detector](#run-vanir-detector)
-
-### Using the GitHub version
-
-#### Prerequisite
-
-##### Linux
-
-Vanir is currently tested only on Linux operating systems. Running Vanir with
-other operating systems may be possible, but is neither tested nor officially
-supported.
-
-
-##### Bazel
-
-Vanir builds using [Bazel](https://bazel.build/). The Vanir Bazel configuration
-files ([WORKSPACE.bazel](./WORKSPACE.bazel) and [BUILD.bazel](./BUILD.bazel)) specify the complete list of
-dependencies and build targets. To understand the complete list of dependencies,
- please refer to the Bazel configuration files.
-
-Vanir has been tested with only **Bazel >= 6.0**. The Bazel installation guide
-can be found from https://bazel.build/install.
-
-Alternatively, you can install and maintain Bazel through Bazelisk. For further
-information on how to install Bazel through Bazelisk, please refer to the
-Bazelisk [README](https://github.com/bazelbuild/bazelisk/blob/master/README.md).
-
-
-##### Git
-
-Though Vanir does not directly use Git at run time, Vanir Bazel build
-configuration uses Git for downloading dependencies. If you haven’t installed
-Git, run the following command and install it:
-
-```posix-terminal
-sudo apt install git
-```
-
-##### JRE
-
-Vanir internally uses [Antlr4](https://www.antlr.org/) for generating parsers,
-and it requires Java 11 or higher. For Ubuntu, install Java 11 as follow:
-
-```posix-terminal
-sudo apt install openjdk-11-jre
-```
-
-##### Other Tools
-
-Vanir targets Python3.9 and C++17. For Python, if you use Bazel, Bazel will
-internally create a repository and register the toolchain for running Vanir. For
- C++, Bazel will not install C++ toolchain but uses the system-installed
- toolchain. When you build Vanir, Bazel will implicitly pass the Vanir default
- options to your compiler, which are specified in `.bazelrc` including
- `-std=c++17`. If your Vanir build fails during compilation, please check the
- compatibility of your toolchain with the options listed in `.bazelrc`.
-
-
-#### Download and Test Vanir
-
-Download the latest version of Vanir from https://github.com/google/vanir.
-In this tutorial, we will assume that you downloaded Vanir at `~/vanir`.
-
-> [!CAUTION]
-> You can use any work directory instead of `~/vanir`,
-> **but please do not use `/tmp/vanir` as your Vanir work directory**.
-> `/tmp/vanir` is used for storing temporary files for Vanir unit tests, and
-> the test would fail due to the Bazel sandboxing rule if you use the
-> `/tmp/vanir` also for storing Vanir source.
-
-If test is successful, you will see the result similar to the following:
-
-```none
-Starting local Bazel server and connecting to it...
-INFO: Analyzed 74 targets (98 packages loaded, 3902 targets configured).
-INFO: Found 48 targets and 26 test targets...
-INFO: Elapsed time: 38.840s, Critical Path: 32.83s
-INFO: 452 processes: 136 internal, 311 linux-sandbox, 5 local.
-INFO: Build completed successfully, 452 total actions
-//:detector_common_flags_test                                            PASSED in 1.0s
-//:detector_runner_test                                                  PASSED in 1.9s
-//:file_list_manager_test                                                PASSED in 1.1s
-//:hasher_test                                                           PASSED in 2.2s
-//:normalizer_test                                                       PASSED in 2.2s
-//:parser_test                                                           PASSED in 0.8s
-//:refiner_test                                                          PASSED in 1.2s
-//:reporter_test                                                         PASSED in 1.0s
-//:sign_generator_runner_test                                            PASSED in 1.1s
-//:sign_generator_test                                                   PASSED in 1.7s
-//:signature_test                                                        PASSED in 2.2s
-//:truncated_path_test                                                   PASSED in 2.6s
-//:version_extractor_test                                                PASSED in 2.2s
-//:vulnerability_manager_test                                            PASSED in 2.8s
-//code_extractors:code_extractor_android_test                            PASSED in 4.6s
-//code_extractors:code_extractor_test                                    PASSED in 3.2s
-//integration_tests:missing_patch_detection_hermetic_test                PASSED in 7.9s
-//language_parsers/cpp:cpp_parser_test                                   PASSED in 0.7s
-//language_parsers/java:java_parser_test                                 PASSED in 1.1s
-//scanners:android_kernel_scanner_test                                   PASSED in 1.0s
-//scanners:offline_directory_scanner_test                                PASSED in 1.0s
-//scanners:package_identifier_test                                       PASSED in 3.2s
-//scanners:package_scanner_test                                          PASSED in 1.3s
-//scanners:repo_scanner_test                                             PASSED in 1.3s
-//scanners:scanner_base_test                                             PASSED in 11.8s
-//scanners:target_selection_strategy_test                                PASSED in 1.1s
-
-Executed 26 out of 26 tests: 26 tests pass.
-```
-
-If you installed all required packages listed in the [Prerequisite section](#prerequisite) and
-the test still fails, please run the following command and contact us with its
-output:
-
-```posix-terminal
-bazel test --test_output=all //...
-```
-> [!NOTE]
-> If you encounter "file name too long" error, this may be due to Bazel sandbox
-> creating a test directory that is longer than 255 characters. In that case,
-> this can be worked around by running bazel or bazelisk with a different output
-> dir, like so:
-> `bazel --output_user_root=/tmp/mybazeldir test --test_output=all //...`
-
-#### Building Vanir
-
-Vanir mainly consists of two components – Vanir Signature Generator and Vanir
-Detector. Vanir signature generator is the component for signature publishes
-such as CNAs to generate Vanir signatures, and Vanir Detector is the component
-for users to check if their target system has any missing patches for the
-provided CVE signatures. The signature generation process is out of scope for
-this document, but feel free to look at
-`bazel run //:sign_generator_runner -- --help` for how it can be used.
-The rest of this document is focused on explaining the use of Vanir Detector.
-
-##### Build Vanir Detector Runner
-
-Though Vanir Detector can be used as a Python library, we also provide Vanir
-Detector as a standalone binary target, _Detector Runner_, for easier use. To
-build the Vanir Detector Runner binary, run the following command from where you
-unpacked Vanir source code (i.e., `~/vanir`):
-
-```posix-terminal
-bazel build //:detector_runner --build_python_zip -c opt
-```
-
-If the build is successful, you will see a message similar to the following:
-
-
-```none
-INFO: Analyzed target //:detector_runner (0 packages loaded, 3783 targets configured).
-INFO: Found 1 target...
-Target //:detector_runner up-to-date:
- bazel-bin/detector_runner.zip
- bazel-bin/detector_runner
-INFO: Elapsed time: 12.456s, Critical Path: 11.45s
-INFO: 17 processes: 9 internal, 4 linux-sandbox, 4 local.
-INFO: Build completed successfully, 17 total actions
-```
-
-and the stand-alone binary file will be created at `./bazel-bin/detector_runner` under your Vanir source directory.
-
-> [!NOTE]
-> The generated binary is a self-contained binary that contains all
-> dependencies. If you don’t need a self-contained binary, you can drop the
-> <code>--build_python_zip</code> flag.
-
-> [!NOTE]
-> Bazel may sometimes complain about missing dependency declarations on
-> standard library headers, e.g. '/usr/lib/gcc/x86\_64-linux-gnu/8/include/stdint.h',
-> especially after the system toolchain was updated. Usually running
-> `bazel clean --expunge` and rebuilding would resolve the issue.
-
-> [!NOTE]
-> You may use `bazel run //:detector_runner` to build and run Vanir detector
-> with a single command. However, different from directly running the binary,
-> when you run the same command with `bazel run`, the working directory of the
-> binary may differ from your current working directory and it may fail to
-> parse some arguments with relative paths (e.g., scanning target). Thus, please
-> consider using absolute paths with `bazel run`.
-
-
-#### Signatures
-
-Vanir is designed to decouple the signature release process & the code release
-process. In the current implementation, Vanir is configured to retrieve
-signatures from Open Source Vulnerability (OSV) databases.
-
-However, if you have custom signature files in a JSON format and need to use
-the signatures instead of the ones in OSV, you can pass the files by using the
-`vulnerability_file_name` flag as follows:
-
-```posix-terminal
-./bazel-bin/detector_runner \
-      --vulnerability_file_name ~/Downloads/vanir_sigs_android_20240321.json \
-      --vulnerability_file_name ~/Downloads/vanir_sigs_qualcomm_20240321.json \
-      ...
-```
-
-
-#### Run Vanir Detector
-
-Now, you are ready to run the Vanir Detector Runner to scan missing patches from
- your Android tree.
-
-All the examples assume you are currently in the Vanir source directory, and
-have downloaded the signature JSON files to `~/Downloads/`.
-
-If you have an Android tree checked out at `~/android-src`, for example, this
-would scan all repositories in it against all known signatures:
-
-```posix-terminal
-./bazel-bin/detector_runner repo_scanner Android ~/android-src
-```
-
-This should take roughly half an hour to scan one AOSP android tree on a modern
-consumer PC.
-
-> [!TIP]
-> Use the `--verbosity` absl flag to control the amount of run time logging.
-> E.g. `--verbosity=-1` will show only WARNING and above logs; `--verbosity=0`
-> will display detailed INFO logs (the default behavior); `--verbosity=1` will
-> display all logs including DEBUG level messages.
-
-> [!TIP]
-> `--vulnerability_file_name `can be specified multiple times, and Vanir will
-> scan against all of the specified signatures.
-
-
-##### Output
-
-By default, Detector Runner will generate report files at
-`/tmp/vanir/YYYYMMDDhhmmss.json` and `/tmp/vanir/YYYYMMDDhhmmss.html`. You can
-also specify the report file name prefix through the flag `--report_file_name`.
-For instance, `--report_file_name=/tmp/foo/bar` will make Vanir to generate
-report files `/tmp/foo/bar.json` and `/tmp/foo/bar.html`.
-
-
-##### Other examples
-
-To run Vanir Detector runner against a local kernel code located at
-`/tmp/test_kernel` with the Android kernel vulnerabilities and their
-pre-generated signatures:
-
-```posix-terminal
-./bazel-bin/detector_runner android_kernel_scanner /tmp/test_kernel
-```
-
-To run Vanir Detector Runner against a locally checked out Android
-frameworks/base source at `/tmp/test\_fwk\_base`:
-
-```posix-terminal
-./bazel-bin/detector_runner \
-      package_scanner Android platform/frameworks/base /tmp/test_fwk_base
-```
-
-To run Vanir Detector Runner against all supported source files in a directory
-against all signatures regardless of whether the file names/paths match what the
-signature patch is.
-
-> [!NOTE]
-> For large projects this may take several hours, and may give false positives
-> for similar but different files!
-
-```posix-terminal
-./bazel-bin/detector_runner \
-      {{ '<strong>' }}--target_selection_strategy all_files{{ '</strong>' }} \
-      offline_directory_scanner /some/directory/with/code
-```
-
-
-##### Some notable command-line options
-
-Vanir Detector Runner supports several optional command line options that allow
-users to set the range of vulnerability scanning or to filter out known issues.
-For instance, the option `--android_spl=2023-03-05` will have Detector Runner
-filter out CVEs released after May 5, 2023.
-
-The option `--cve_id_ignore_list=CVE-1234-12345,CVE-4567-45678` will make Vanir
-explicitly ignore findings from the designated two CVEs. Similarly, the
-option `--sign_target_path_filter=drivers/nvme` will make Vanir ignore
-findings from the NVMe device drivers.
-
-More thorough description of available flags can be obtained from the following
-Vanir Detector help command:
-
-```posix-terminal
-~/vanir_beta/bazel-bin/detector_runner --help
-```
-
-##### Scanners
-
-You may have noticed that Vanir *Detector Runners* has several *Scanners*, each
-of which can be used to scan a different type of target. We have shown how to
-use `repo_scanner` to run scan against an entire Android tree managed with
-`repo`, `package_scanner` to scan one Android subproject,
-`android_kernel_scanner` for special handling of Android kernel git
-repositories, and `offline_directory_scanner` for general scanning of anything
-against everything.
-
-To get a list of all options and available Vanir scanners, run:
-
-```posix-terminal
-./bazel-bin/detector_runner
-```
-
-To get usage for a particular scanner, select that scanner without providing any
-argument, e.g. to see how repo scanner can be used, run:
-
-```posix-terminal
-./bazel-bin/detector_runner repo_scanner
-```
-
-…which should show:
+tree-sitter officially requires Python >= 3.10, as declared in its
+[`pyproject.toml`](https://github.com/tree-sitter/py-tree-sitter/blob/master/pyproject.toml):
 
 ```
-…
-Usage for repo_scanner:
-  detector_runner.py repo_scanner ecosystem code_location
+requires-python = ">=3.10"
 ```
 
-#### Looking at Results
+No `cp39` wheel is published on PyPI. Vanir supports Python 3.9, so a guard is
+required to prevent crashes.
 
-For a modern PC with ~16 CPU threads, Vanir can take around 10-20 minutes to
-finish scanning an Android source tree (the time may vary depending on the
-execution environment). Once the test is completed, Vanir Detector Runner will
-output a quick summary of the result, similar to:
+### Guard location: `python_parser.py`
 
+**Place 1 -- import guard (module level):**
 
-```none
-Scanned 833 source files (skipped 106253 source files likely unaffected by known vulnerabilities).
-Found 12 potentially unpatched vulnerabilities: CVE-2020-11116, CVE-2020-26139, CVE-2020-26141, CVE-2020-26145, CVE-2020-26146, CVE-2020-3698, CVE-2021-0476, CVE-2021-1977, CVE-2021-30319, CVE-2022-22065, CVE-2022-25670, CVE-2023-43534
-Detailed report:
- - /tmp/vanir/report-20240321182302.html
- - /tmp/vanir/report-20240321182302.json
+```python
+try:
+    import tree_sitter_python as _tspython
+    from tree_sitter import Language, QueryCursor
+    _TREE_SITTER_AVAILABLE = True
+except ImportError:
+    _TREE_SITTER_AVAILABLE = False
 ```
 
+Runs once at module import time. On Python 3.9, the `except` branch runs and
+`_TREE_SITTER_AVAILABLE` is set to `False`.
 
-and the detailed test result reports will be generated in /tmp/vanir/ directory
-(or at wherever specified with `--report_file_name`).
+**Place 2 -- extensions guard:**
 
-The following is an example Vanir Detector Runner JSON report file (which is
-more machine readable):
+```python
+@classmethod
+def get_supported_extensions(cls):
+    return ['.py'] if _TREE_SITTER_AVAILABLE else []
+```
 
+When `language_parsers.py` calls `get_parser_class("foo.py")`, it checks
+`get_supported_extensions()` for every parser. On Python 3.9 this returns `[]` --
+so `.py` is not in the list, `PythonParser` is never selected, and `.py` files are
+silently skipped. C/C++ and Java parsers continue to work normally.
+
+The guard is not in `tree_sitter_base.py`. The base class has no guard. It
+assumes if it is being instantiated, tree-sitter is available. The guard lives in
+the concrete subclass which is the one that knows whether its language package is
+installed.
+
+---
+
+## Testing Across Python Versions
+
+### Docker setup
+
+Four Docker containers for Linux testing (tree-sitter requires Linux for Bazel):
+
+| Container | Python version | Command |
+|-----------|---------------|---------|
+| `vanir-py310` | 3.10 | `docker compose run --rm vanir-py310` |
+| `vanir-py311` | 3.11 | `docker compose run --rm vanir-py311` |
+| `vanir-py312` | 3.12 | `docker compose run --rm vanir-py312` |
+| `vanir-py313` | 3.13 | `docker compose run --rm vanir-py313` |
+
+Each container has its own named Bazel cache volume so Python toolchains do not
+conflict across versions.
+
+To verify which Python version is running inside a container:
+```bash
+python3 --version
+```
+
+### Running tests inside a container
+
+```bash
+# Attach to a running container
+docker exec -it vanir-uw-vanir-py312-1 bash
+
+# Run all Vanir tests
+bazel test //... --config=py3.12 --test_output=all
+```
+
+All 23 existing tests pass across Python 3.10, 3.11, 3.12, and 3.13 with zero
+regressions.
+
+### Python 3.9 behavior
+
+On Python 3.9, Bazel will fail at build time when trying to resolve tree-sitter
+wheels:
+
+```
+No matching wheel for current configuration's Python version.
+This distribution supports the following Python configuration settings:
+    //_config:is_cp310
+    //_config:is_cp311
+    //_config:is_cp312
+    //_config:is_cp313
+```
+
+This is expected. tree-sitter has no 3.9 wheel. The guard in `python_parser.py`
+handles this at runtime: `_TREE_SITTER_AVAILABLE = False` and `.py` files are
+skipped.
+
+---
+
+## End-to-End Validation
+
+The new Python parser was validated end-to-end using a real CVE against a real
+Python codebase.
+
+### Vulnerability: GHSA-xjgw-4wvw-rgm4
+
+A path traversal vulnerability (CVSS 9.0 Critical) in `mcp-atlassian`, a Python
+MCP server for Atlassian tools. The fix was released in v0.17.0.
+
+### Vulnerability input file (`mcp_vuln.json`)
+
+Since mcp-atlassian is a PyPI package and Vanir only supports GIT and Android
+ecosystems natively, the vulnerability was expressed as a GIT-type entry:
 
 ```json
-{
-    "options": "--target_root=/tmp/test_kernel_simple --vulnerability_file_name=/tmp/vanir_vul_with_sign_20230705.json",
-    "covered_cves": [
-        "CVE-2017-18509",
-        ...
-        "CVE-2023-20938"
-    ],
-    "missing_patches": [
-        {
-            "ID": "ASB-A-174737742",
-            "CVE": [
-                "CVE-2020-15436"
-            ],
-            "OSV": "https://osv.dev/vulnerability/ASB-A-174737742",
-            "details": [
-                {
-                    "unpatched_code": "fs/block_dev.c::blkdev_get",
-                    "patch": "https://android.googlesource.com/kernel/common/+/49289b1fa5a67011",
-                    "matched_signature": "ASB-A-174737742-1030258c"
-                },
-                {
-                    "unpatched_code": "fs/block_dev.c",
-                    "patch": "https://android.googlesource.com/kernel/common/+/49289b1fa5a67011",
-                    "matched_signature": "ASB-A-174737742-339e9e91"
-                }
-            ]
-        },
-        ...
-        {
-            "ID": "ASB-A-185125206",
-            "CVE": [
-                "CVE-2021-39698"
-            ],
-            "OSV": "https://osv.dev/vulnerability/ASB-A-185125206",
-            "details": [
-                {
-                    "unpatched_code": "fs/signalfd.c::signalfd_cleanup",
-                    "patch": "https://android.googlesource.com/kernel/common/+/9537bae0da1f",
-                    "matched_signature": "ASB-A-185125206-c9d43168"
-                },
-                {
-                    "unpatched_code": "fs/signalfd.c",
-                    "patch": "https://android.googlesource.com/kernel/common/+/9537bae0da1f",
-                    "matched_signature": "ASB-A-185125206-e8972c8a"
-                }
-            ]
-        }
-    ]
-}
-
+[{
+  "id": "GHSA-xjgw-4wvw-rgm4",
+  "modified": "2025-03-01T00:00:00Z",
+  "summary": "mcp-atlassian path traversal",
+  "affected": [{
+    "ranges": [{
+      "type": "GIT",
+      "repo": "https://github.com/sooperset/mcp-atlassian",
+      "events": [
+        {"introduced": "0"},
+        {"fixed": "52b9b0997681e87244b20d58034deae89c91631e"}
+      ]
+    }]
+  }]
+}]
 ```
 
-The JSON report file presents the result in a key-value structure, where the
-meaning of each key is as follows:
+### Sign generation
 
+```bash
+bazel run //:sign_generator_runner --config=py3.11 -- \
+  --vulnerability_file_name=/workspace/mcp_vuln.json \
+  --signature_file_name=/tmp/vanir/sigs.json
+```
 
-<table>
-  <thead>
-   <tr>
-    <th>Key</th>
-    <th>Value</th>
-   </tr>
-  </thead>
-  <tr>
-   <td><strong><code>options</code></strong>
-   </td>
-   <td>Explicitly passed command options
-   </td>
-  </tr>
-  <tr>
-   <td><strong><code>covered_cves</code></strong>
-   </td>
-   <td>List of the CVEs covered by Vanir.
-   </td>
-  </tr>
-  <tr>
-   <td><strong><code>missing_patch</code></strong>
-   </td>
-   <td>A list of the detailed information of each unpatched CVE. <strong><code>ID</code></strong> is a unique ID of the vulnerability used in OSV, and <strong><code>CVE</code></strong> is a list of CVE aliases (most vulnerabilities have a single CVE entry). <strong><code>OSV</code></strong> is the public OSV URL of the vulnerability, which has more details of the vulnerability entry information if the CVE is not embargoed. <br/>
-The <strong><code>details</code></strong> field is a list of unpatched code snippets in the following formats:
+Vanir clones the repo, computes the diff at commit `52b9b09`, runs `PythonParser`
+on both the vulnerable and patched versions of each changed file, hashes the
+chunks, and writes signatures to `sigs.json`.
 
-<table>
-  <tr>
-   <td><strong><code>unpatched_code</code></strong>
-   </td>
-   <td>The relative path to the unpatched file and the function from the scanned target root.
-   </td>
-  </tr>
-  <tr>
-   <td><strong><code>patch</code></strong>
-   </td>
-   <td>The public URL to the patch that should be applied.
-   </td>
-  </tr>
-  <tr>
-   <td><strong><code>matched_signature</code></strong>
-   </td>
-   <td>The unique ID of the matched signature. The details can be found from the <strong><code>$VUL_FILE</code></strong> passed to the detector.
-   </td>
-  </tr>
-</table>
+### Detection
 
+```bash
+# Clone the last vulnerable version
+git clone https://github.com/sooperset/mcp-atlassian /tmp/mcp-atlassian
+cd /tmp/mcp-atlassian && git checkout v0.16.1
 
-   </td>
-  </tr>
-</table>
+# Scan it
+bazel run //:detector_runner --config=py3.11 -- \
+  --vulnerability_file_name=/tmp/vanir/sigs.json \
+  --target_selection_strategy=all_files \
+  --report_file_name_prefix=/tmp/vanir/mcp-report \
+  --minimum_number_of_files=1 \
+  offline_directory_scanner /tmp/mcp-atlassian
+```
 
-The HTML report file shows the same result in a more human-readable format as
-follows:
+**Result:** `GHSA-xjgw-4wvw-rgm4` correctly flagged as unpatched in v0.16.1. The
+vulnerable function `download_attachment` in `attachments.py` was detected.
 
-![HTML report screenshot](https://raw.githubusercontent.com/google/vanir/refs/heads/main/docs/images/vanir_detector_report.png)
+### Parser validation on large Python codebases
+
+The detector was also run against `requests` and `flask` to validate the parser on
+larger real-world Python codebases:
+
+```bash
+git clone https://github.com/psf/requests /tmp/requests
+
+bazel run //:detector_runner --config=py3.12 -- \
+  --vulnerability_file_name=/tmp/vanir/sigs.json \
+  --target_selection_strategy=all_files \
+  --report_file_name_prefix=/tmp/vanir/report \
+  --minimum_number_of_files=1 \
+  offline_directory_scanner /tmp/requests
+```
+
+Both ran with 0 parse errors across all scanned `.py` files.
+
