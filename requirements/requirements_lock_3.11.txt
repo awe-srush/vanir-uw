@@ -174,6 +174,10 @@ six==1.17.0
     # via python-dateutil
 tenacity==9.1.2
     # via -r requirements/requirements.txt
+tree-sitter==0.25.2 ; python_version >= "3.10"
+    # via -r requirements/requirements.txt
+tree-sitter-python==0.25.0 ; python_version >= "3.10"
+    # via -r requirements/requirements.txt
 typing-extensions==4.15.0
     # via
     #   -r requirements/requirements.txt
