@@ -671,3 +671,77 @@ bazel run //:detector_runner --config=py3.12 -- \
 
 Both ran with 0 parse errors across all scanned `.py` files.
 
+---
+
+## Benchmarking
+
+The parser was benchmarked against two large real-world Python codebases. Scrapy
+was run twice to separate Bazel build time from actual parser performance.
+
+### Command used
+
+```bash
+time bazel run //:detector_runner --config=py3.12 -- \
+  --vulnerability_file_name=/tmp/vanir/sigs.json \
+  --target_selection_strategy=all_files \
+  --report_file_name_prefix=/tmp/vanir/report \
+  --minimum_number_of_files=1 \
+  offline_directory_scanner /tmp/<repo>
+```
+
+### Scrapy -- Run 1 (cold, includes Bazel build)
+
+```
+Files scanned: 445
+Bazel build:   81.7s  (downloading ANTLR jar, compiling C++ extensions, resolving deps)
+real:          1m27s
+user:          0m2.9s
+sys:           0m0.7s
+```
+
+Bazel built everything from scratch -- ANTLR jar download, C++ extension compilation,
+dependency resolution. The actual scanning of 445 files was only ~5 seconds of the
+total time.
+
+### Scrapy -- Run 2 (warm, Bazel fully cached)
+
+```
+Files scanned: 445
+Bazel build:   3.1s   (0 packages loaded, everything cached)
+real:          0m7.4s
+user:          0m1.9s
+sys:           0m0.4s
+```
+
+Bazel found everything cached. The real time dropped from 1m27s to 7.4s. Subtracting
+Bazel overhead (~3s), actual parse time was ~4 seconds for 445 files -- approximately
+**111 files/second**.
+
+### Django -- Run 2 (warm, Bazel fully cached)
+
+```
+Files scanned: 2900
+Bazel build:   4.1s   (0 packages loaded, everything cached)
+real:          0m14.3s
+user:          0m3.3s
+sys:           0m3.6s
+```
+
+Subtracting Bazel overhead (~4s), actual parse time was ~10 seconds for 2900 files --
+approximately **290 files/second**.
+
+### Summary
+
+| Repo | Files | Build overhead | Parse time | Files/sec |
+|------|-------|---------------|------------|-----------|
+| Scrapy (run 1) | 445 | 81.7s (cold) | ~5s | ~89/sec |
+| Scrapy (run 2) | 445 | 3.1s (cached) | ~4s | ~111/sec |
+| Django (run 2) | 2900 | 4.1s (cached) | ~10s | ~290/sec |
+
+Zero parse errors across all files in both repos.
+
+### Note on first vs second run
+
+The first run always includes Bazel build time which can add 60-90 seconds. The
+second run uses cached build artifacts and reflects true parser performance. For
+benchmarking purposes, always use the second run.
